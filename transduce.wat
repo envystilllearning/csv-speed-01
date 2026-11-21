@@ -238,6 +238,7 @@
   (func $span (param $s i32) (param $e i32)
     (local $i i32) (local $j i32) (local $b i32)
     (local $b2 i32) (local $b3 i32) (local $cp i32) (local $x i64)
+    (local $v v128) (local $bm i32)
     (if (i32.gt_u (local.get $e) (local.get $s))
       (then (global.set $g_valChars
         (i32.add (global.get $g_valChars) (i32.sub (local.get $e) (local.get $s))))))
@@ -245,6 +246,35 @@
     (block $done
       (loop $lp
         (br_if $done (i32.ge_u (local.get $i) (local.get $e)))
+        ;; SIMD fast path: a clean 16-byte chunk is stored wholesale;
+        ;; when a chunk holds a special byte, bulk-copy its clean prefix
+        ;; and let the paths below handle that byte.
+        (if (i32.le_u (i32.add (local.get $i) (i32.const 16)) (local.get $e))
+          (then
+            (local.set $v (v128.load (local.get $i)))
+            (local.set $bm
+              (i8x16.bitmask
+                (v128.or
+                  (v128.or
+                    (i8x16.lt_u (local.get $v) (i8x16.splat (i32.const 32)))
+                    (i8x16.eq (local.get $v) (i8x16.splat (i32.const 34))))
+                  (v128.or
+                    (i8x16.eq (local.get $v) (i8x16.splat (i32.const 92)))
+                    (i8x16.eq (local.get $v) (i8x16.splat (i32.const 237)))))))
+            (if (i32.eqz (local.get $bm))
+              (then
+                (if (i32.gt_u (i32.add (global.get $g_out) (i32.const 16)) (i32.const 69206016))
+                  (then (global.set $g_failed (i32.const 1)))
+                  (else
+                    (v128.store (global.get $g_out) (local.get $v))
+                    (global.set $g_out (i32.add (global.get $g_out) (i32.const 16)))))
+                (local.set $i (i32.add (local.get $i) (i32.const 16)))
+                (br $lp)))
+            (local.set $j (i32.add (local.get $i) (i32.ctz (local.get $bm))))
+            (if (i32.gt_u (local.get $j) (local.get $i))
+              (then
+                (call $rec_putn (local.get $i) (i32.sub (local.get $j) (local.get $i)))
+                (local.set $i (local.get $j))))))
         ;; SWAR fast path: a clean 8-byte chunk is stored wholesale
         (if (i32.le_u (i32.add (local.get $i) (i32.const 8)) (local.get $e))
           (then
@@ -349,12 +379,39 @@
   (func $read_unquoted
     (local $i i32) (local $seg i32) (local $c i32)
     (local $x i64) (local $m i64) (local $j i32)
+    (local $v v128) (local $bm i32)
     (block $ret
       (loop $lu
         (local.set $seg (global.get $g_pos))
         (local.set $i (local.get $seg))
         (block $sd
           (loop $sl
+            ;; SIMD: skip 16 bytes at a time while none is , LF CR or "
+            ;; (a quote is only a candidate: in unquoted text it is an
+            ;; ordinary byte, so the scan steps past it and goes on)
+            (if (i32.le_u (i32.add (local.get $i) (i32.const 16)) (global.get $g_decEnd))
+              (then
+                (local.set $v (v128.load (local.get $i)))
+                (local.set $bm
+                  (i32.or
+                    (i32.or
+                      (i8x16.bitmask (i8x16.eq (local.get $v) (i8x16.splat (i32.const 44))))
+                      (i8x16.bitmask (i8x16.eq (local.get $v) (i8x16.splat (i32.const 10)))))
+                    (i32.or
+                      (i8x16.bitmask (i8x16.eq (local.get $v) (i8x16.splat (i32.const 13))))
+                      (i8x16.bitmask (i8x16.eq (local.get $v) (i8x16.splat (i32.const 34)))))))
+                (if (i32.eqz (local.get $bm))
+                  (then
+                    (local.set $i (i32.add (local.get $i) (i32.const 16)))
+                    (br $sl)))
+                (local.set $j (i32.add (local.get $i) (i32.ctz (local.get $bm))))
+                (local.set $c (i32.load8_u (local.get $j)))
+                (if (i32.eq (local.get $c) (i32.const 34))
+                  (then
+                    (local.set $i (i32.add (local.get $j) (i32.const 1)))
+                    (br $sl)))
+                (local.set $i (local.get $j))
+                (br $sd)))
             ;; SWAR: skip 8 bytes at a time while none is , LF or CR
             (if (i32.le_u (i32.add (local.get $i) (i32.const 8)) (global.get $g_decEnd))
               (then
@@ -457,6 +514,7 @@
   (func $read_quoted
     (local $open i32) (local $openLine i32) (local $i i32) (local $seg i32)
     (local $c i32) (local $outSave i32) (local $step i32) (local $x i64)
+    (local $v v128) (local $bm i32) (local $j i32)
     (local.set $open (global.get $g_pos))
     (local.set $openLine (global.get $g_line))
     (local.set $outSave (global.get $g_out))
@@ -464,6 +522,29 @@
     (local.set $seg (local.get $i))
     (block $ret
       (loop $lq
+        ;; SIMD: skip 16 bytes at a time while none is quote, CR or LF;
+        ;; an LF candidate only needs a line increment (handled inline),
+        ;; a quote or CR candidate falls into the dispatch below.
+        (if (i32.le_u (i32.add (local.get $i) (i32.const 16)) (global.get $g_decEnd))
+          (then
+            (local.set $v (v128.load (local.get $i)))
+            (local.set $bm
+              (i32.or
+                (i8x16.bitmask (i8x16.eq (local.get $v) (i8x16.splat (i32.const 34))))
+                (i32.or
+                  (i8x16.bitmask (i8x16.eq (local.get $v) (i8x16.splat (i32.const 13))))
+                  (i8x16.bitmask (i8x16.eq (local.get $v) (i8x16.splat (i32.const 10)))))))
+            (if (i32.eqz (local.get $bm))
+              (then
+                (local.set $i (i32.add (local.get $i) (i32.const 16)))
+                (br $lq)))
+            (local.set $j (i32.add (local.get $i) (i32.ctz (local.get $bm))))
+            (if (i32.eq (i32.load8_u (local.get $j)) (i32.const 10))
+              (then
+                (global.set $g_line (i32.add (global.get $g_line) (i32.const 1)))
+                (local.set $i (i32.add (local.get $j) (i32.const 1)))
+                (br $lq)))
+            (local.set $i (local.get $j))))
         ;; SWAR: skip chunks holding no quote, CR or LF (an LF would need
         ;; a line increment, a quote or CR would need real work)
         (if (i32.le_u (i32.add (local.get $i) (i32.const 8)) (global.get $g_decEnd))
