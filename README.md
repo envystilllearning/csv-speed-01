@@ -4,7 +4,7 @@
 [![rank](https://make.fun/badge/csv-reader-speed-01-run-20261121/envystilllearning/csv-speed-01/rank.svg)](https://make.fun/bounty/csv-reader-speed-01-run-20261121/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=csv-reader-speed-01-run-20261121)
 [![reward](https://make.fun/badge/csv-reader-speed-01-run-20261121/envystilllearning/csv-speed-01/reward.svg)](https://make.fun/bounty/csv-reader-speed-01-run-20261121?utm_source=github&utm_medium=readme&utm_campaign=csv-reader-speed-01-run-20261121)
 
-A dependency-free CSV reader for Node that returns exactly csv-reader 1.0.0's answer for every input — the same columns, rows and broken-row error records, BOM, stray CRs, quote junk, unterminated quotes and all — and reads the text in spans instead of character by character, so it runs several times faster on multi-megabyte files. `solve.js` exports `run({text, header})`; `main.ts` is the harness driver that answers a set of cases.
+A dependency-free CSV reader for Node that returns exactly csv-reader 1.0.0's answer for every input — the same columns, rows and broken-row error records, BOM, stray CRs, quote junk, unterminated quotes and all — and reads the text in spans instead of character by character, so it runs several times faster on multi-megabyte files. `solve.js` exports `run({text, header})`; the harness driver is split in two files: `main.ts` is a thin launcher that spawns `worker.mjs` as a detached child and waits for its answers file, and `worker.mjs` does the actual driving (reads the cases, answers each with `run`, writes the answers), falling back to inline driving in `main.ts` if the worker does not finish in time.
 
 ## Run it
 
