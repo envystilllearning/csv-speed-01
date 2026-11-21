@@ -1,34 +1,36 @@
-// The v4 driver: zero-JSON streaming over cases.json.
+// The v5 driver: zero-JSON, zero-copy streaming over cases.json.
 //
-// cases.json is read as ONE Buffer and scanned structurally (never
-// JSON.parse'd as a whole): for each case we locate the raw escaped bytes
-// of its "text" string and the "header" flag that follows, copy the bytes
-// into the WASM transducer's memory, and assemble that case's answer from
-// the regions the transducer filled (see transduce.wat) with Buffer
-// copies only — no row objects, no JSON.stringify of answers.
+// cases.json is read DIRECTLY into the WASM transducer's input region
+// (fs.readSync into the memory buffer) and scanned structurally on that
+// memory — never JSON.parse'd as a whole, and no case's bytes are ever
+// copied in JS: for each case we locate the raw escaped bytes of its
+// "text" string and the "header" flag that follows, point the transducer
+// at the span in place, and let it assemble the case's complete answer
+// object in its answer region (see transduce.wat). The driver writes
+// that region to answers.json with a single writeSync per case.
 //
-// Fallbacks keep the output exact no matter what: a case whose escaped
-// text exceeds the WASM input region, or for which the transducer reports
-// overflow, is answered by solve.js (the semantic reference) via
-// JSON.parse of just that case's string literal. If the structural scan
-// itself does not recognize the file, the whole file is answered the v1
-// way (JSON.parse + solve.js).
+// Fallbacks keep the output exact no matter what: a file larger than the
+// input region is read into a JS Buffer instead and each case copied in
+// (the v4 path); a case whose escaped text exceeds the input region, or
+// for which the transducer reports overflow, is answered by solve.js
+// (the semantic reference) via JSON.parse of just that case's string
+// literal; if the structural scan does not recognize the file at all,
+// the whole file is answered the v1 way (JSON.parse + solve.js).
 
-const fs = require('node:fs');
-const path = require('node:path');
-
-require('node:v8').setFlagsFromString('--no-incremental-marking');
+const gb = typeof process.getBuiltinModule === 'function'
+  ? process.getBuiltinModule.bind(process)
+  : null;
+const fs = gb ? gb('fs') : require('node:fs');
+(gb ? gb('node:v8') : require('node:v8')).setFlagsFromString('--no-incremental-marking');
 
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 // WASM memory layout (must match transduce.wat).
 const IN_BASE = 0x200000;
-const IN_CAP = 0x1000000; // 16 MiB of escaped input per case
-const TABLE = 0x1000;
-const ERR_BASE = 0x4200000;
+const IN_CAP = 0x1000000; // 16 MiB input region
 
-const wasmBytes = fs.readFileSync(path.join(__dirname, 'w.wasm'));
+const wasmBytes = fs.readFileSync(__dirname + '/w.wasm');
 const instance = new WebAssembly.Instance(new WebAssembly.Module(wasmBytes), {});
 const mem = instance.exports.memory;
 const transduce = instance.exports.transduce;
@@ -40,16 +42,47 @@ function loadSolve() {
   return solveRun;
 }
 
-const data = fs.readFileSync(path.join(INPUT_DIR, 'cases.json'));
+// ---- load cases.json -------------------------------------------------------
+// Preferred path: the whole file lands in the WASM input region, so the
+// scan below runs on a Buffer view of that memory and every case span is
+// already where the transducer wants it. The memory is one fixed block
+// that never grows, so the view stays valid for the whole run.
+const inPath = INPUT_DIR + '/cases.json';
+let data = null; // Buffer whose index 0 is file offset 0
+let zeroCopy = false;
+{
+  const ifd = fs.openSync(inPath, 'r');
+  const size = fs.fstatSync(ifd).size;
+  if (size <= IN_CAP) {
+    let off = 0;
+    while (off < size) {
+      const n = fs.readSync(ifd, memBuf, IN_BASE + off, size - off, off);
+      if (n <= 0) break;
+      off += n;
+    }
+    if (off === size) {
+      data = memBuf.subarray(IN_BASE, IN_BASE + size);
+      zeroCopy = true;
+    }
+  }
+  fs.closeSync(ifd);
+  if (data === null) data = fs.readFileSync(inPath);
+}
 
 // ---- structural scan -------------------------------------------------------
 // Collect {s, e, header} per case: the escaped text spans [s, e) of the
-// "text":"..." string body, plus the header flag after it. The pattern
-// '"text":"' can only occur structurally: inside a string body every
-// quote is escaped, so the pattern's bare quotes never appear there, and
-// we only search from outside a consumed span.
+// "text":"..." string body, plus the header flag after it. Both patterns
+// can only occur structurally: inside a string body every quote byte is
+// the second byte of a \" pair, so '","header":' — whose third byte is a
+// quote preceded by a comma, not a backslash — never matches inside a
+// body; the span end is the '","header":' match start. As a belt-and-
+// braces check, the match is only accepted when the run of backslashes
+// immediately before that quote is even (zero included), which is
+// exactly the condition for it to be the string's closing quote; on an
+// odd run the search resumes after the match. If anything is not found
+// where it must be, the scan gives up and the driver falls back.
 const TEXT_PAT = Buffer.from('"text":"');
-const HDR_PAT = Buffer.from('"header":');
+const END_PAT = Buffer.from('","header":');
 const cases = [];
 let scanOk = true;
 {
@@ -58,48 +91,26 @@ let scanOk = true;
     const t = data.indexOf(TEXT_PAT, p);
     if (t === -1) break;
     const s = t + TEXT_PAT.length;
-    let i = s;
-    while (i < data.length) {
-      const b = data[i];
-      if (b === 0x5c) { i += 2; continue; }
-      if (b === 0x22) break;
-      i += 1;
+    let i = -1;
+    let hb = 0;
+    let from = s;
+    for (;;) {
+      const m = data.indexOf(END_PAT, from);
+      if (m === -1) break;
+      let bs = 0;
+      let j = m - 1;
+      while (j >= s && data[j] === 0x5c) { bs++; j--; }
+      if ((bs & 1) === 1) { from = m + 1; continue; }
+      const b = data[m + END_PAT.length];
+      if (b !== 0x74 && b !== 0x66) break; // 't' | 'f'
+      i = m;
+      hb = b;
+      break;
     }
-    if (i >= data.length) { scanOk = false; break; }
-    const hIdx = data.indexOf(HDR_PAT, i);
-    if (hIdx === -1 || hIdx > i + 64) { scanOk = false; break; }
-    const hb = data[hIdx + HDR_PAT.length];
-    if (hb !== 0x74 && hb !== 0x66) { scanOk = false; break; } // 't' | 'f'
+    if (i === -1) { scanOk = false; break; }
     cases.push({ s, e: i, header: hb === 0x74 });
     p = i + 1;
   }
-}
-
-function assemble(header) {
-  const recCount = memBuf.readInt32LE(4);
-  const errLen = memBuf.readInt32LE(8);
-  const parts = [Buffer.from('{"columns":')];
-  const rec = (k) => {
-    const off = memBuf.readInt32LE(TABLE + k * 8);
-    const len = memBuf.readInt32LE(TABLE + k * 8 + 4);
-    return memBuf.subarray(off, off + len);
-  };
-  let firstRow = 0;
-  if (header) {
-    parts.push(recCount > 0 ? rec(0) : Buffer.from('[]'));
-    firstRow = 1;
-  } else {
-    parts.push(Buffer.from('null'));
-  }
-  parts.push(Buffer.from(',"rows":['));
-  for (let k = firstRow; k < recCount; k++) {
-    if (k > firstRow) parts.push(Buffer.from(','));
-    parts.push(rec(k));
-  }
-  parts.push(Buffer.from('],"errors":['));
-  if (errLen > 0) parts.push(memBuf.subarray(ERR_BASE, ERR_BASE + errLen));
-  parts.push(Buffer.from(']}'));
-  return Buffer.concat(parts);
 }
 
 function fallbackCase(c) {
@@ -107,33 +118,57 @@ function fallbackCase(c) {
   return Buffer.from(JSON.stringify(loadSolve()({ text, header: c.header })));
 }
 
-let out;
+const OPEN = Buffer.from('[');
+const CLOSE = Buffer.from(']');
+const COMMA = Buffer.from(',');
+
+function writeAll(ofd, buf, off, len) {
+  let done = 0;
+  while (done < len) {
+    done += fs.writeSync(ofd, buf, off + done, len - done, null);
+  }
+}
+
 if (!scanOk) {
   const all = JSON.parse(data.toString('utf8'));
   const run = loadSolve();
-  out = Buffer.from(JSON.stringify(all.map((c) => run(c.input))));
+  fs.writeFileSync(
+    OUTPUT_DIR + '/answers.json',
+    Buffer.from(JSON.stringify(all.map((c) => run(c.input)))));
 } else {
-  const parts = [Buffer.from('[')];
+  const ofd = fs.openSync(OUTPUT_DIR + '/answers.json', 'w');
+  writeAll(ofd, OPEN, 0, 1);
   for (let ci = 0; ci < cases.length; ci++) {
-    if (ci > 0) parts.push(Buffer.from(','));
+    if (ci > 0) writeAll(ofd, COMMA, 0, 1);
     const c = cases[ci];
     const len = c.e - c.s;
-    let ans = null;
+    let wrote = false;
     if (len <= IN_CAP) {
-      data.copy(memBuf, IN_BASE, c.s, c.e);
+      let inPtr = IN_BASE;
+      if (zeroCopy) {
+        inPtr = IN_BASE + c.s;
+      } else {
+        data.copy(memBuf, IN_BASE, c.s, c.e);
+      }
       let status = 1;
       try {
-        transduce(IN_BASE, len, c.header ? 1 : 0);
+        transduce(inPtr, len, c.header ? 1 : 0);
         status = memBuf.readInt32LE(0);
       } catch {
         status = 1;
       }
-      if (status === 0) ans = assemble(c.header);
+      if (status === 0) {
+        const ansPtr = memBuf.readInt32LE(16);
+        const ansLen = memBuf.readInt32LE(20);
+        writeAll(ofd, memBuf, ansPtr, ansLen);
+        wrote = true;
+      }
     }
-    parts.push(ans === null ? fallbackCase(c) : ans);
+    if (!wrote) {
+      const fb = fallbackCase(c);
+      writeAll(ofd, fb, 0, fb.length);
+    }
   }
-  parts.push(Buffer.from(']'));
-  out = Buffer.concat(parts);
+  writeAll(ofd, CLOSE, 0, 1);
+  fs.closeSync(ofd);
 }
-
-fs.writeFileSync(path.join(OUTPUT_DIR, 'answers.json'), out);

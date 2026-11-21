@@ -9,14 +9,19 @@
 ;;   results block at 0:  [0]=status (0 ok, 1 overflow -> driver falls back)
 ;;                        [4]=record count        [8]=errors byte length
 ;;                        [12]=decoded byte length
+;;                        [16]=answer offset       [20]=answer byte length
 ;;   record table at 4096: recordCount pairs (offset, length) of each
 ;;                        record's serialized JSON array text in REC region
 ;;   errors region: the case's error objects, comma-joined, no brackets
+;;   answer region (ANS): the COMPLETE case answer object,
+;;                        {"columns":...,"rows":[...],"errors":[...]},
+;;                        assembled here from the record table + errors
+;;                        region, so the driver writes it with a single
+;;                        writeSync and never copies answer bytes in JS.
 ;;
-;; The driver assembles {"columns":...,"rows":[...],"errors":[...]} from
-;; these regions with Buffer copies only. Memory is one fixed block; any
-;; region overflow sets status=1 and the driver answers that case with the
-;; JS path (solve.js) instead, so output is never wrong for size reasons.
+;; Memory is one fixed block; any region overflow (including the answer
+;; region) sets status=1 and the driver answers that case with the JS
+;; path (solve.js) instead, so output is never wrong for size reasons.
 ;;
 ;; Surrogates: \uXXXX decoding combines a surrogate pair into its astral
 ;; codepoint (UTF-8); a lone surrogate is carried as WTF-8 bytes and the
@@ -24,7 +29,7 @@
 ;; would emit, so field bytes match the reference exactly either way.
 
 (module
-  (memory (export "memory") 1120 1120)
+  (memory (export "memory") 1760 1760)
 
   ;; ---- static strings -------------------------------------------------
   (data (i32.const 2048) "stray_cr")
@@ -39,6 +44,11 @@
   (data (i32.const 2336) ",\"fields\":")
   (data (i32.const 2368) ",\"extra\":[")
   (data (i32.const 2400) ",\"\"")
+  (data (i32.const 2432) "{\"columns\":")
+  (data (i32.const 2464) ",\"rows\":[")
+  (data (i32.const 2496) "],\"errors\":[")
+  (data (i32.const 2528) "]}")
+  (data (i32.const 2560) "[]")
 
   ;; ---- globals ----------------------------------------------------------
   (global $g_failed (mut i32) (i32.const 0))
@@ -62,6 +72,7 @@
   (global $g_endWidth (mut i32) (i32.const 0))   ;; REC addr just past field #width
   (global $g_extraStart (mut i32) (i32.const 0)) ;; REC addr of field #width+1 start
   (global $g_fmtPtr (mut i32) (i32.const 0))
+  (global $g_ans (mut i32) (i32.const 73400320)) ;; ANS write pointer
 
   ;; ---- region writers ---------------------------------------------------
   (func $rec_put (param $b i32)
@@ -89,6 +100,58 @@
       (then (global.set $g_failed (i32.const 1)) (return)))
     (memory.copy (global.get $g_err) (local.get $p) (local.get $l))
     (global.set $g_err (i32.add (global.get $g_err) (local.get $l))))
+
+  ;; ANS region: 73400320 .. 115343360 (40 MiB) — the assembled answer.
+  (func $ans_put (param $b i32)
+    (if (i32.ge_u (global.get $g_ans) (i32.const 115343360))
+      (then (global.set $g_failed (i32.const 1)) (return)))
+    (i32.store8 (global.get $g_ans) (local.get $b))
+    (global.set $g_ans (i32.add (global.get $g_ans) (i32.const 1))))
+
+  (func $ans_putn (param $p i32) (param $l i32)
+    (if (i32.eqz (local.get $l)) (then (return)))
+    (if (i32.gt_u (i32.add (global.get $g_ans) (local.get $l)) (i32.const 115343360))
+      (then (global.set $g_failed (i32.const 1)) (return)))
+    (memory.copy (global.get $g_ans) (local.get $p) (local.get $l))
+    (global.set $g_ans (i32.add (global.get $g_ans) (local.get $l))))
+
+  ;; Assemble the complete answer object into the ANS region, byte-for-byte
+  ;; the layout the v4 JS driver produced:
+  ;;   {"columns":<rec0 | [] | null>,"rows":[recs joined by ','],
+  ;;    "errors":[<error bytes>]}
+  (func $assemble
+    (local $k i32) (local $firstRow i32) (local $off i32) (local $len i32)
+    (global.set $g_ans (i32.const 73400320))
+    (call $ans_putn (i32.const 2432) (i32.const 11))
+    (if (global.get $g_header)
+      (then
+        (if (global.get $g_recCount)
+          (then
+            (call $ans_putn (i32.load (i32.const 4096)) (i32.load (i32.const 4100))))
+          (else (call $ans_putn (i32.const 2560) (i32.const 2))))
+        (local.set $firstRow (i32.const 1)))
+      (else
+        (call $ans_putn (i32.const 2304) (i32.const 4))
+        (local.set $firstRow (i32.const 0))))
+    (call $ans_putn (i32.const 2464) (i32.const 9))
+    (local.set $k (local.get $firstRow))
+    (block $done
+      (loop $lp
+        (br_if $done (i32.ge_u (local.get $k) (global.get $g_recCount)))
+        (if (i32.gt_u (local.get $k) (local.get $firstRow))
+          (then (call $ans_put (i32.const 44))))
+        (local.set $off
+          (i32.load (i32.add (i32.const 4096) (i32.mul (local.get $k) (i32.const 8)))))
+        (local.set $len
+          (i32.load (i32.add (i32.const 4100) (i32.mul (local.get $k) (i32.const 8)))))
+        (call $ans_putn (local.get $off) (local.get $len))
+        (local.set $k (i32.add (local.get $k) (i32.const 1)))
+        (br $lp)))
+    (call $ans_putn (i32.const 2496) (i32.const 12))
+    (local.set $len (i32.sub (global.get $g_err) (i32.const 69206016)))
+    (if (local.get $len)
+      (then (call $ans_putn (i32.const 69206016) (local.get $len))))
+    (call $ans_putn (i32.const 2528) (i32.const 2)))
 
   ;; ---- small helpers ------------------------------------------------------
   (func $hex_digit (param $v i32) (result i32)
@@ -483,6 +546,7 @@
     (local $rp i32) (local $rend i32) (local $wp i32)
     (local $b i32) (local $c i32) (local $cp i32) (local $ob i32)
     (local $lo i32) (local $adv i32) (local $x i64)
+    (local $v v128) (local $m i32) (local $n i32)
     (local.set $rp (local.get $p))
     (local.set $rend (i32.add (local.get $p) (local.get $len)))
     (global.set $g_inEnd (local.get $rend))
@@ -492,6 +556,30 @@
         (br_if $done (i32.ge_u (local.get $rp) (local.get $rend)))
         (if (i32.gt_u (i32.add (local.get $wp) (i32.const 4)) (i32.const 35651584))
           (then (global.set $g_failed (i32.const 1)) (br $done)))
+        ;; SIMD: copy clean 16-byte chunks (no backslash anywhere); when
+        ;; a chunk does hold a backslash, copy only its clean prefix and
+        ;; let the paths below handle the escape itself.
+        (if (i32.le_u (i32.add (local.get $rp) (i32.const 16)) (local.get $rend))
+          (then
+            (if (i32.le_u (i32.add (local.get $wp) (i32.const 16)) (i32.const 35651584))
+              (then
+                (local.set $v (v128.load (local.get $rp)))
+                (local.set $m
+                  (i8x16.bitmask
+                    (i8x16.eq (local.get $v) (i8x16.splat (i32.const 92)))))
+                (if (i32.eqz (local.get $m))
+                  (then
+                    (v128.store (local.get $wp) (local.get $v))
+                    (local.set $wp (i32.add (local.get $wp) (i32.const 16)))
+                    (local.set $rp (i32.add (local.get $rp) (i32.const 16)))
+                    (br $lp)))
+                (local.set $n (i32.ctz (local.get $m)))
+                (if (local.get $n)
+                  (then
+                    (memory.copy (local.get $wp) (local.get $rp) (local.get $n))
+                    (local.set $wp (i32.add (local.get $wp) (local.get $n)))
+                    (local.set $rp (i32.add (local.get $rp) (local.get $n)))
+                    (br $lp)))))))
         ;; SWAR: copy clean 8-byte chunks (no backslash anywhere)
         (if (i32.le_u (i32.add (local.get $rp) (i32.const 8)) (local.get $rend))
           (then
@@ -692,6 +780,7 @@
   ;; ---- entry point -----------------------------------------------------------
   (func (export "transduce") (param $inPtr i32) (param $inLen i32) (param $header i32)
     (global.set $g_failed (i32.const 0))
+    (global.set $g_ans (i32.const 73400320))
     (global.set $g_out (i32.const 35651584))
     (global.set $g_err (i32.const 69206016))
     (global.set $g_errCount (i32.const 0))
@@ -703,7 +792,10 @@
     (global.set $g_fEnd (i32.const 2))
     (call $decode (local.get $inPtr) (local.get $inLen))
     (if (i32.eqz (global.get $g_failed)) (then (call $parse)))
+    (if (i32.eqz (global.get $g_failed)) (then (call $assemble)))
     (i32.store (i32.const 0) (global.get $g_failed))
     (i32.store (i32.const 4) (global.get $g_recCount))
-    (i32.store (i32.const 8) (i32.sub (global.get $g_err) (i32.const 69206016))))
+    (i32.store (i32.const 8) (i32.sub (global.get $g_err) (i32.const 69206016)))
+    (i32.store (i32.const 16) (i32.const 73400320))
+    (i32.store (i32.const 20) (i32.sub (global.get $g_ans) (i32.const 73400320))))
 )
